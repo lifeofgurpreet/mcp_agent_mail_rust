@@ -402,6 +402,36 @@ fn tool_input_schemas_match_python_fixture() {
     }
 }
 
+#[test]
+fn reservation_conflict_schema_requires_an_explicit_anonymous_mode() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tools = get_rust_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "check_file_reservation_conflicts")
+        .expect("reservation conflict tool");
+    let properties = tool.input_schema["properties"]
+        .as_object()
+        .expect("input schema properties");
+    let required = tool.input_schema["required"]
+        .as_array()
+        .expect("input schema required")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+
+    assert!(properties.contains_key("project_key"));
+    assert!(properties.contains_key("paths"));
+    assert!(properties.contains_key("agent_name"));
+    assert!(properties.contains_key("caller_mode"));
+    assert!(required.contains("project_key"));
+    assert!(required.contains("paths"));
+    assert!(!required.contains("agent_name"));
+    assert!(!required.contains("caller_mode"));
+    assert!(tool.description.contains("caller_mode='anonymous'"));
+    assert!(tool.description.contains("ignores no reservation rows"));
+}
+
 /// Verify the fixture itself is well-formed and non-empty.
 #[test]
 fn fixture_is_valid() {

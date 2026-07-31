@@ -1,0 +1,35 @@
+{
+  "conflict_free": false,
+  "conflicts": [
+    {
+      "path": "src/calm.rs",
+      "holders": [
+        {
+          "agent": "CalmRiver",
+          "path_pattern": "src/calm.rs",
+          "exclusive": true,
+          "expires_ts": "__EXPIRES_TS_1__"
+        }
+      ]
+    },
+    {
+      "path": "src/stone.rs",
+      "holders": [
+        {
+          "agent": "StoneOwl",
+          "path_pattern": "src/stone.rs",
+          "exclusive": true,
+          "expires_ts": "__EXPIRES_TS_2__"
+        }
+      ]
+    }
+  ],
+  "clear_paths": [],
+  "checked_paths": 2,
+  "total_conflicting_reservations": 2,
+  "output_truncated": false,
+  "project": "__PROJECT_HUMAN_KEY__",
+  "snapshot_ts": "__SNAPSHOT_TS__",
+  "authoritative_source": "database_snapshot",
+  "read_only": true
+}

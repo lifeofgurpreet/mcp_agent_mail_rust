@@ -198,6 +198,58 @@ const MAX_CONFLICT_CHECK_SNAPSHOT_ROWS: usize = 10_000;
 const MAX_CONFLICT_HOLDERS_PER_PATH: usize = 50;
 const MAX_CONFLICT_HOLDERS_TOTAL: usize = 1_000;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConflictCheckCaller {
+    Named(String),
+    Anonymous,
+}
+
+fn resolve_conflict_check_caller(
+    agent_name: Option<&str>,
+    caller_mode: Option<&str>,
+    paths: &[String],
+) -> McpResult<ConflictCheckCaller> {
+    let mode = caller_mode.map(str::trim);
+    let named = |name: &str| {
+        let caller = name.trim();
+        if caller.is_empty() || caller.len() > 256 || caller.contains('\0') {
+            return Err(legacy_tool_error(
+                "INVALID_AGENT_NAME",
+                "agent_name must be non-empty, NUL-free, and at most 256 bytes",
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        }
+        Ok(ConflictCheckCaller::Named(
+            mcp_agent_mail_core::models::normalize_agent_name(caller)
+                .unwrap_or_else(|| caller.to_string()),
+        ))
+    };
+
+    match (mode, agent_name) {
+        (None | Some("named"), Some(name)) => named(name),
+        (Some("anonymous"), None) => Ok(ConflictCheckCaller::Anonymous),
+        (None | Some("named"), None) => Err(legacy_tool_error(
+            "MISSING_AGENT_NAME",
+            "agent_name is required unless caller_mode is explicitly 'anonymous'",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        )),
+        (Some("anonymous"), Some(_)) => Err(legacy_tool_error(
+            "AMBIGUOUS_CALLER_MODE",
+            "agent_name must be omitted when caller_mode is 'anonymous'",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        )),
+        (Some(other), _) => Err(legacy_tool_error(
+            "INVALID_CALLER_MODE",
+            format!("caller_mode must be 'named' or 'anonymous', got {other:?}"),
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        )),
+    }
+}
+
 fn validate_conflict_check_paths(paths: &[String]) -> McpResult<()> {
     if paths.is_empty() {
         return Err(legacy_tool_error(
@@ -1508,13 +1560,14 @@ fn acquire_outcome<T>(
 /// without registering identities, cleaning up leases, healing archives, or
 /// changing reservation state.
 #[tool(
-    description = "Check project-relative paths against authoritative active exclusive file reservations without mutating Agent Mail.\n\nThis is the guard-safe read API for pre-edit, pre-commit, and pre-push checks. It resolves the existing caller identity and active leases in one fresh database snapshot, ignores only reservations owned by that canonical caller ID, and reports exact, glob, and ancestor conflicts. Expired, released, and shared reservations do not block. Malformed request or stored patterns fail closed. The call never registers agents or projects, cleans up leases, releases reservations, heals archives, or writes mailbox state.\n\nParameters\n----------\nproject_key : str\n    Existing project human key or slug.\nagent_name : str\n    Existing caller identity. Case-insensitive lookup resolves the canonical lowest-ID identity.\npaths : list[str]\n    One to 200 project-relative paths or glob patterns.\n\nReturns\n-------\ndict\n    { conflict_free, conflicts, clear_paths, checked_paths, total_conflicting_reservations, output_truncated, project, snapshot_ts, authoritative_source, read_only }"
+    description = "Check project-relative paths against authoritative active exclusive file reservations without mutating Agent Mail.\n\nThis is the guard-safe read API for pre-edit, pre-commit, and pre-push checks. Named mode resolves the existing caller identity and active leases in one fresh database snapshot, ignores only reservations owned by that canonical caller ID, and preserves the original API when agent_name is supplied without caller_mode. Anonymous mode must be requested explicitly with caller_mode='anonymous' and agent_name omitted; it requires no registered agent and ignores no reservation rows. Expired, released, and shared reservations do not block. Ambiguous caller parameters and malformed request or stored patterns fail closed. The call never registers agents or projects, cleans up leases, releases reservations, heals archives, or writes mailbox state.\n\nParameters\n----------\nproject_key : str\n    Existing project human key or slug.\nagent_name : str, optional\n    Existing caller identity for named mode. Case-insensitive lookup resolves the canonical lowest-ID identity. Omit only for explicit anonymous mode.\npaths : list[str]\n    One to 200 project-relative paths or glob patterns, with at most 65536 combined bytes.\ncaller_mode : str, optional\n    'named' or 'anonymous'. Defaults to named only when agent_name is supplied. Anonymous mode requires agent_name to be omitted and includes every active exclusive reservation.\n\nReturns\n-------\ndict\n    { conflict_free, conflicts, clear_paths, checked_paths, total_conflicting_reservations, output_truncated, project, snapshot_ts, authoritative_source, read_only }"
 )]
 pub async fn check_file_reservation_conflicts(
     ctx: &McpContext,
     project_key: String,
-    agent_name: String,
+    agent_name: Option<String>,
     paths: Vec<String>,
+    caller_mode: Option<String>,
 ) -> McpResult<String> {
     validate_conflict_check_paths(&paths)?;
 
@@ -1530,17 +1583,16 @@ pub async fn check_file_reservation_conflicts(
             json!({"fail_closed": true, "do_not_edit": paths}),
         ));
     }
-    let caller = agent_name.trim();
-    if caller.is_empty() || caller.len() > 256 || caller.contains('\0') {
-        return Err(legacy_tool_error(
-            "INVALID_AGENT_NAME",
-            "agent_name must be non-empty, NUL-free, and at most 256 bytes",
-            true,
-            json!({"fail_closed": true, "do_not_edit": paths}),
-        ));
-    }
-    let caller = mcp_agent_mail_core::models::normalize_agent_name(caller)
-        .unwrap_or_else(|| caller.to_string());
+    let caller =
+        resolve_conflict_check_caller(agent_name.as_deref(), caller_mode.as_deref(), &paths)?;
+    let snapshot_caller = match &caller {
+        ConflictCheckCaller::Named(name) => {
+            mcp_agent_mail_db::queries::ReservationConflictSnapshotCaller::Named(name)
+        }
+        ConflictCheckCaller::Anonymous => {
+            mcp_agent_mail_db::queries::ReservationConflictSnapshotCaller::Anonymous
+        }
+    };
 
     let pool = get_authoritative_live_db_pool()?;
     let snapshot = acquire_outcome(
@@ -1548,7 +1600,7 @@ pub async fn check_file_reservation_conflicts(
             ctx.cx(),
             &pool,
             project_key,
-            &caller,
+            snapshot_caller,
             MAX_CONFLICT_CHECK_SNAPSHOT_ROWS,
         )
         .await,
@@ -1602,7 +1654,7 @@ pub async fn check_file_reservation_conflicts(
     let mut holder_by_agent = HashMap::with_capacity(snapshot.reservations.len());
     let mut indexed = Vec::with_capacity(snapshot.reservations.len());
     for reservation in &snapshot.reservations {
-        if reservation.agent_id == snapshot.caller_agent_id {
+        if snapshot.caller_agent_id == Some(reservation.agent_id) {
             continue;
         }
         let Some(holder) = reservation.agent_name.as_deref() else {
@@ -3439,7 +3491,7 @@ mod tests {
                     &check_file_reservation_conflicts(
                         &ctx,
                         project_key,
-                        "bluelake".to_string(),
+                        Some("bluelake".to_string()),
                         vec![
                             "src/main.rs".to_string(),
                             "src/**".to_string(),
@@ -3451,6 +3503,7 @@ mod tests {
                             "shared/file.rs".to_string(),
                             "free/file.rs".to_string(),
                         ],
+                        None,
                     )
                     .await
                     .expect("conflict check"),
@@ -3532,12 +3585,18 @@ mod tests {
                 )
                 .await;
 
+                let agents_before = match queries::list_agents(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("before agent snapshot failed: {other:?}"),
+                };
+
                 let ctx = McpContext::new(cx.clone(), 1);
                 let error = check_file_reservation_conflicts(
                     &ctx,
                     project_key,
-                    "GhostAgent".to_string(),
+                    Some("GhostAgent".to_string()),
                     vec!["src/guard.rs".to_string()],
+                    None,
                 )
                 .await
                 .expect_err("unregistered caller must fail closed");
@@ -3550,7 +3609,210 @@ mod tests {
                     data["error"]["data"]["reservation_acquire"]["do_not_edit"],
                     serde_json::json!(["src/guard.rs"])
                 );
+                let agents_after = match queries::list_agents(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("after agent snapshot failed: {other:?}"),
+                };
+                assert_eq!(
+                    agents_before
+                        .iter()
+                        .map(|agent| (agent.id, agent.name.as_str(), agent.last_active_ts))
+                        .collect::<Vec<_>>(),
+                    agents_after
+                        .iter()
+                        .map(|agent| (agent.id, agent.name.as_str(), agent.last_active_ts))
+                        .collect::<Vec<_>>(),
+                    "unknown named callers must not be registered or touched"
+                );
             });
+        });
+    }
+
+    #[test]
+    fn anonymous_conflict_check_includes_every_holder_and_has_no_activity_writes() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-anonymous-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let first = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let second = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    first.id.expect("first holder id"),
+                    "src/green.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    second.id.expect("second holder id"),
+                    "src/blue.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+
+                let reservations_before =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("before reservation snapshot failed: {other:?}"),
+                    };
+                let agents_before = match queries::list_agents(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("before agent snapshot failed: {other:?}"),
+                };
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let response: ReservationConflictCheckResponse = serde_json::from_str(
+                    &check_file_reservation_conflicts(
+                        &ctx,
+                        project_key,
+                        None,
+                        vec!["src/green.rs".to_string(), "src/blue.rs".to_string()],
+                        Some("anonymous".to_string()),
+                    )
+                    .await
+                    .expect("anonymous conflict check"),
+                )
+                .expect("response json");
+
+                assert!(!response.conflict_free);
+                assert!(response.read_only);
+                assert_eq!(response.checked_paths, 2);
+                assert_eq!(response.total_conflicting_reservations, 2);
+                assert_eq!(response.conflicts.len(), 2);
+                assert_eq!(
+                    response
+                        .conflicts
+                        .iter()
+                        .flat_map(|conflict| conflict.holders.iter())
+                        .map(|holder| holder.agent.as_str())
+                        .collect::<HashSet<_>>(),
+                    HashSet::from(["BlueLake", "GreenCastle"]),
+                    "anonymous mode must not ignore any holder"
+                );
+
+                let reservations_after =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("after reservation snapshot failed: {other:?}"),
+                    };
+                let agents_after = match queries::list_agents(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("after agent snapshot failed: {other:?}"),
+                };
+                assert_eq!(
+                    reservations_before
+                        .iter()
+                        .map(|row| (row.id, row.released_ts, row.expires_ts))
+                        .collect::<Vec<_>>(),
+                    reservations_after
+                        .iter()
+                        .map(|row| (row.id, row.released_ts, row.expires_ts))
+                        .collect::<Vec<_>>(),
+                    "anonymous conflict checks must not change reservation state"
+                );
+                assert_eq!(
+                    agents_before
+                        .iter()
+                        .map(|agent| (agent.id, agent.name.as_str(), agent.last_active_ts))
+                        .collect::<Vec<_>>(),
+                    agents_after
+                        .iter()
+                        .map(|agent| (agent.id, agent.name.as_str(), agent.last_active_ts))
+                        .collect::<Vec<_>>(),
+                    "anonymous conflict checks must not register or touch agents"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn conflict_check_caller_modes_and_request_bounds_fail_closed() {
+        run_async(|cx| async move {
+            let ctx = McpContext::new(cx, 1);
+            let project_key = "/tmp/conflict-check-input-contract".to_string();
+
+            let missing_mode = check_file_reservation_conflicts(
+                &ctx,
+                project_key.clone(),
+                None,
+                vec!["src/lib.rs".to_string()],
+                None,
+            )
+            .await
+            .expect_err("implicit anonymous mode must fail closed");
+            assert_eq!(
+                missing_mode.data.expect("missing mode data")["error"]["type"],
+                "MISSING_AGENT_NAME"
+            );
+
+            let ambiguous = check_file_reservation_conflicts(
+                &ctx,
+                project_key.clone(),
+                Some("BlueLake".to_string()),
+                vec!["src/lib.rs".to_string()],
+                Some("anonymous".to_string()),
+            )
+            .await
+            .expect_err("anonymous mode with a named caller must fail closed");
+            assert_eq!(
+                ambiguous.data.expect("ambiguous mode data")["error"]["type"],
+                "AMBIGUOUS_CALLER_MODE"
+            );
+
+            let invalid_mode = check_file_reservation_conflicts(
+                &ctx,
+                project_key.clone(),
+                None,
+                vec!["src/lib.rs".to_string()],
+                Some("all".to_string()),
+            )
+            .await
+            .expect_err("unknown caller mode must fail closed");
+            assert_eq!(
+                invalid_mode.data.expect("invalid mode data")["error"]["type"],
+                "INVALID_CALLER_MODE"
+            );
+
+            let too_many = check_file_reservation_conflicts(
+                &ctx,
+                project_key.clone(),
+                None,
+                (0..=MAX_CONFLICT_CHECK_PATHS)
+                    .map(|index| format!("src/{index}.rs"))
+                    .collect(),
+                Some("anonymous".to_string()),
+            )
+            .await
+            .expect_err("anonymous mode must retain the path-count bound");
+            assert_eq!(
+                too_many.data.expect("too many data")["error"]["type"],
+                "TOO_MANY_PATHS"
+            );
+
+            let oversized_payload = check_file_reservation_conflicts(
+                &ctx,
+                project_key,
+                None,
+                (0..17)
+                    .map(|index| format!("{index:02}/{}", "a".repeat(4_092)))
+                    .collect(),
+                Some("anonymous".to_string()),
+            )
+            .await
+            .expect_err("anonymous mode must retain the payload-byte bound");
+            assert_eq!(
+                oversized_payload.data.expect("payload data")["error"]["type"],
+                "PAYLOAD_TOO_LARGE"
+            );
         });
     }
 
@@ -3590,7 +3852,7 @@ mod tests {
                     &cx,
                     &pool,
                     &project_key,
-                    "BlueLake",
+                    queries::ReservationConflictSnapshotCaller::Named("BlueLake"),
                     1,
                 )
                 .await
@@ -3605,7 +3867,7 @@ mod tests {
                     &cx,
                     &pool,
                     &project_key,
-                    "BlueLake",
+                    queries::ReservationConflictSnapshotCaller::Named("BlueLake"),
                     10,
                 )
                 .await
@@ -3614,6 +3876,22 @@ mod tests {
                     other => panic!("prime snapshot failed: {other:?}"),
                 };
                 assert_eq!(primed.reservations.len(), 2);
+                assert!(primed.caller_agent_id.is_some());
+
+                let anonymous = match queries::get_reservation_conflict_snapshot(
+                    &cx,
+                    &pool,
+                    &project_key,
+                    queries::ReservationConflictSnapshotCaller::Anonymous,
+                    10,
+                )
+                .await
+                {
+                    Outcome::Ok(snapshot) => snapshot,
+                    other => panic!("anonymous snapshot failed: {other:?}"),
+                };
+                assert_eq!(anonymous.caller_agent_id, None);
+                assert_eq!(anonymous.reservations.len(), 2);
                 match queries::release_reservations(
                     &cx,
                     &pool,
@@ -3633,8 +3911,9 @@ mod tests {
                     &check_file_reservation_conflicts(
                         &ctx,
                         project_key,
-                        "BlueLake".to_string(),
+                        Some("BlueLake".to_string()),
                         vec!["src/first.rs".to_string()],
+                        None,
                     )
                     .await
                     .expect("fresh conflict check"),
@@ -3661,8 +3940,9 @@ mod tests {
                 let malformed_request = check_file_reservation_conflicts(
                     &ctx,
                     project_key.clone(),
-                    "BlueLake".to_string(),
+                    Some("BlueLake".to_string()),
                     vec!["[broken".to_string()],
+                    None,
                 )
                 .await
                 .expect_err("malformed request must fail closed");
@@ -3682,8 +3962,9 @@ mod tests {
                 let malformed_stored = check_file_reservation_conflicts(
                     &ctx,
                     project_key,
-                    "BlueLake".to_string(),
+                    None,
                     vec!["src/main.rs".to_string()],
+                    Some("anonymous".to_string()),
                 )
                 .await
                 .expect_err("malformed stored reservation must fail closed");

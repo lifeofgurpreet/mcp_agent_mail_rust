@@ -98,6 +98,75 @@
       }
     },
     {
+      "name": "anonymous_no_ignore_reports_all_holders",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/conflict-check-anonymous",
+        "caller_mode": "anonymous",
+        "paths": ["src/calm.rs", "src/stone.rs"]
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/conflict-check-anonymous"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-anonymous",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "CalmRiver"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-anonymous",
+              "program": "claude-code",
+              "model": "opus-4.1",
+              "name": "StoneOwl"
+            }
+          },
+          {
+            "name": "file_reservation_paths",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-anonymous",
+              "agent_name": "StoneOwl",
+              "paths": ["src/stone.rs"],
+              "ttl_seconds": 3600,
+              "exclusive": true,
+              "reason": "anonymous all-holders fixture"
+            }
+          },
+          {
+            "name": "file_reservation_paths",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/conflict-check-anonymous",
+              "agent_name": "CalmRiver",
+              "paths": ["src/calm.rs"],
+              "ttl_seconds": 3600,
+              "exclusive": true,
+              "reason": "anonymous all-holders fixture"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/check_file_reservation_conflicts/anonymous_no_ignore_reports_all_holders.output.json"
+      },
+      "normalize": {
+        "replace": {
+          "/project": "__PROJECT_HUMAN_KEY__",
+          "/snapshot_ts": "__SNAPSHOT_TS__",
+          "/conflicts/0/holders/0/expires_ts": "__EXPIRES_TS_1__",
+          "/conflicts/1/holders/0/expires_ts": "__EXPIRES_TS_2__"
+        }
+      }
+    },
+    {
       "name": "empty_paths_fail_closed",
       "input": {
         "project_key": "__FIXTURE_ROOT__/projects/conflict-check-clear",

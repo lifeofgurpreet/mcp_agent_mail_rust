@@ -1212,7 +1212,10 @@ fn build_tool_directory() -> ToolDirectory {
                     related: vec!["file_reservation_paths".to_string(), "release_file_reservations".to_string()],
                     expected_frequency: "Before edits or commits on contested surfaces.".to_string(),
                     required_capabilities: vec!["file_reservations".to_string()],
-                    usage_examples: vec![ToolUsageExample { hint: "Pre-edit check".to_string(), sample: "check_file_reservation_conflicts(project_key='backend', agent_name='BlueLake', paths=['src/app.py'])".to_string() }],
+                    usage_examples: vec![
+                        ToolUsageExample { hint: "Named pre-edit check".to_string(), sample: "check_file_reservation_conflicts(project_key='backend', agent_name='BlueLake', paths=['src/app.py'])".to_string() },
+                        ToolUsageExample { hint: "Anonymous no-ignore guard".to_string(), sample: "check_file_reservation_conflicts(project_key='backend', caller_mode='anonymous', paths=['src/app.py'])".to_string() },
+                    ],
                     capabilities: vec!["file_reservations".to_string()],
                     complexity: "low".to_string(),
                 },

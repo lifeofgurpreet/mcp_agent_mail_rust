@@ -9349,12 +9349,24 @@ pub struct ReservationConflictSnapshotRow {
     pub expires_ts: i64,
 }
 
-/// A project, canonical caller identity, and reservation set observed in one
-/// fresh database transaction.
+/// The caller scope for an authoritative reservation-conflict snapshot.
+///
+/// `Named` preserves the existing canonical identity lookup and lets the tool
+/// ignore only that agent's own leases. `Anonymous` performs no agent lookup
+/// and deliberately ignores no reservation rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationConflictSnapshotCaller<'a> {
+    Named(&'a str),
+    Anonymous,
+}
+
+/// A project, optional canonical caller identity, and reservation set observed
+/// in one fresh database transaction.
 #[derive(Debug, Clone)]
 pub struct ReservationConflictSnapshot {
     pub project: ProjectRow,
-    pub caller_agent_id: i64,
+    /// Canonical caller ID for named checks. `None` means anonymous/no-ignore.
+    pub caller_agent_id: Option<i64>,
     pub captured_ts: i64,
     pub reservations: Vec<ReservationConflictSnapshotRow>,
     /// True when the active reservation set exceeded the SQL-level row cap.
@@ -9367,15 +9379,16 @@ pub struct ReservationConflictSnapshot {
 ///
 /// The active-row bound is part of the SQL query (`limit + 1`), rather than a
 /// check performed after an unbounded materialization. Holder names are loaded
-/// in bounded chunks inside the same transaction. Resolving the caller to its
-/// canonical lowest-ID case-insensitive identity in that transaction ensures
-/// self-reservation filtering is keyed to an existing row rather than trusted
-/// caller-supplied text.
+/// in bounded chunks inside the same transaction. Named snapshots resolve the
+/// caller to its canonical lowest-ID case-insensitive identity in that
+/// transaction, ensuring self-reservation filtering is keyed to an existing
+/// row rather than trusted caller-supplied text. Anonymous snapshots skip
+/// caller resolution and retain every active exclusive reservation.
 pub async fn get_reservation_conflict_snapshot(
     cx: &Cx,
     pool: &DbPool,
     project_key: &str,
-    caller_name: &str,
+    caller: ReservationConflictSnapshotCaller<'_>,
     max_reservations: usize,
 ) -> Outcome<ReservationConflictSnapshot, DbError> {
     if max_reservations == 0 {
@@ -9438,36 +9451,42 @@ pub async fn get_reservation_conflict_snapshot(
             )));
         };
 
-        let caller_rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(
-                traw_query(
+        let caller_agent_id = match caller {
+            ReservationConflictSnapshotCaller::Named(caller_name) => {
+                let caller_rows = try_in_tx!(
                     cx,
                     &tracked,
-                    "SELECT id FROM agents \
-                     WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                     ORDER BY id ASC LIMIT 1",
-                    &[
-                        Value::BigInt(project_id),
-                        Value::Text(caller_name.to_string()),
-                    ],
-                )
-                .await,
-            )
-        );
-        let Some(caller_row) = caller_rows.first() else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::not_found(
-                "Agent",
-                format!("{project_id}:{caller_name}"),
-            ));
-        };
-        let Some(caller_agent_id) = caller_row.get(0).and_then(value_as_i64) else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(
-                "reservation conflict snapshot caller has no valid id".to_string(),
-            ));
+                    map_sql_outcome(
+                        traw_query(
+                            cx,
+                            &tracked,
+                            "SELECT id FROM agents \
+                             WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                             ORDER BY id ASC LIMIT 1",
+                            &[
+                                Value::BigInt(project_id),
+                                Value::Text(caller_name.to_string()),
+                            ],
+                        )
+                        .await,
+                    )
+                );
+                let Some(caller_row) = caller_rows.first() else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::not_found(
+                        "Agent",
+                        format!("{project_id}:{caller_name}"),
+                    ));
+                };
+                let Some(caller_agent_id) = caller_row.get(0).and_then(value_as_i64) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(
+                        "reservation conflict snapshot caller has no valid id".to_string(),
+                    ));
+                };
+                Some(caller_agent_id)
+            }
+            ReservationConflictSnapshotCaller::Anonymous => None,
         };
         let sql_limit = i64::try_from(max_reservations.saturating_add(1)).unwrap_or(i64::MAX);
         let active_predicate = active_reservation_predicate_for("fr");
